@@ -64,12 +64,9 @@ pub const HttpClient = struct {
         // Add the query parameters
         if (params.len > 0) {
             try writer.writeByte('?');
-            try urlEncodeParam(writer, params[0][0], params[0][1]);
-
-            for (params[1..]) |param| {
-                try writer.writeByte('&');
-                try urlEncodeParam(writer, param[0], param[1]);
-            }
+            const query_string = try encodeParams(self.allocator, params);
+            defer self.allocator.free(query_string);
+            try writer.writeAll(query_string);
         }
 
         return url_buffer.toOwnedSlice();
@@ -184,6 +181,27 @@ fn parseUrl(allocator: Allocator, url: []const u8) !Url {
     };
 }
 
+/// Encodes a list of key-value pairs into a URL query string
+fn encodeParams(allocator: Allocator, params: []const [2][]const u8) ![]const u8 {
+    var buffer = ArrayList(u8).init(allocator);
+    defer buffer.deinit();
+    
+    const writer = buffer.writer();
+    
+    // Add the first parameter
+    if (params.len > 0) {
+        try urlEncodeParam(writer, params[0][0], params[0][1]);
+        
+        // Add the rest of the parameters
+        for (params[1..]) |param| {
+            try writer.writeByte('&');
+            try urlEncodeParam(writer, param[0], param[1]);
+        }
+    }
+    
+    return buffer.toOwnedSlice();
+}
+
 /// URL encodes a key-value pair and writes it to the writer
 fn urlEncodeParam(writer: anytype, key: []const u8, value: []const u8) !void {
     try urlEncode(writer, key);
@@ -263,4 +281,19 @@ test "build url" {
     defer allocator.free(url);
     
     try std.testing.expectEqualStrings("http://example.com/api?key=value&q=search+term", url);
+}
+
+test "encode params" {
+    const allocator = std.testing.allocator;
+    
+    const params = [_][2][]const u8{
+        .{ "key1", "value1" },
+        .{ "key2", "value with spaces" },
+        .{ "special", "!@#" },
+    };
+    
+    const query_string = try encodeParams(allocator, &params);
+    defer allocator.free(query_string);
+    
+    try std.testing.expectEqualStrings("key1=value1&key2=value+with+spaces&special=%21%40%23", query_string);
 }
