@@ -14,12 +14,32 @@ pub fn main() !void {
     var client = HttpClient.init(allocator);
     defer client.deinit();
 
-    // Build a URL with query parameters
-    const url = try client.buildUrl("http://httpbin.org/get", &.{
+    // Generate timestamp parameter dynamically
+    var timestamp_buffer: [32]u8 = undefined;
+    const timestamp = try getTimestampStr(&timestamp_buffer);
+    
+    // Build parameters list with dynamic timestamp parameter
+    const ParamPair = [2][]const u8;
+    var params = ArrayList(ParamPair).init(allocator);
+    defer params.deinit();
+    
+    try params.appendSlice(&[_]ParamPair{
         .{ "key1", "val1" },
         .{ "key2", "value with spaces" },
         .{ "special", "!@#$%^&*()" },
     });
+    
+    // Add timestamp parameter
+    try params.append(.{ "timestamp", timestamp });
+    
+    // Print all parameters
+    std.debug.print("Parameters:\n", .{});
+    for (params.items) |param| {
+        std.debug.print("  {s}: {s}\n", .{ param[0], param[1] });
+    }
+
+    // Build a URL with query parameters
+    const url = try client.buildUrl("http://httpbin.org/get", params.items);
     defer allocator.free(url);
 
     std.debug.print("Making request to: {s}\n", .{url});
@@ -31,6 +51,12 @@ pub fn main() !void {
     // Print the response
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Response:\n{s}\n", .{response});
+}
+
+/// Gets the current timestamp as a string
+fn getTimestampStr(buffer: []u8) ![]const u8 {
+    const timestamp = std.time.timestamp();
+    return std.fmt.bufPrint(buffer, "{d}", .{timestamp});
 }
 
 /// Simple HTTP client
