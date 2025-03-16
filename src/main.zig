@@ -1,6 +1,9 @@
 const std = @import("std");
 const net = std.net;
 const mem = std.mem;
+const fmt = std.fmt;
+const http = std.http;
+const Uri = std.Uri;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 
@@ -10,6 +13,9 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
+    // Get standard output writer
+    const stdout = std.io.getStdOut().writer();
+
     // Create a new HTTP client
     var client = HttpClient.init(allocator);
     defer client.deinit();
@@ -17,46 +23,54 @@ pub fn main() !void {
     // Generate timestamp parameter dynamically
     var timestamp_buffer: [32]u8 = undefined;
     const timestamp = try getTimestampStr(&timestamp_buffer);
-    
+
     // Build parameters list with dynamic timestamp parameter
-    const ParamPair = [2][]const u8;
-    var params = ArrayList(ParamPair).init(allocator);
+    // Use StringHashMap for key-value pairs
+    var params = std.StringHashMap([]const u8).init(allocator);
     defer params.deinit();
-    
-    try params.appendSlice(&[_]ParamPair{
-        .{ "key1", "val1" },
-        .{ "key2", "value with spaces" },
-        .{ "special", "!@#$%^&*()" },
-    });
-    
-    // Add timestamp parameter
-    try params.append(.{ "timestamp", timestamp });
-    
+
+    // Add parameters
+    try params.put("key1", "val1");
+    try params.put("key2", "value with spaces");
+    try params.put("special", "!@#$%^&*()");
+    try params.put("timestamp", timestamp);
+
     // Print all parameters
-    std.debug.print("Parameters:\n", .{});
-    for (params.items) |param| {
-        std.debug.print("  {s}: {s}\n", .{ param[0], param[1] });
+    try stdout.print("Parameters:\n", .{});
+    var param_it = params.iterator();
+    while (param_it.next()) |entry| {
+        try stdout.print("  {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+
+    // Convert parameters to array for buildUrl
+    var param_array = ArrayList([2][]const u8).init(allocator);
+    defer param_array.deinit();
+
+    var it = params.iterator();
+    while (it.next()) |entry| {
+        try param_array.append(.{ entry.key_ptr.*, entry.value_ptr.* });
     }
 
     // Build a URL with query parameters
-    const url = try client.buildUrl("http://httpbin.org/get", params.items);
+    const url = try client.buildUrl("http://httpbin.org/get", param_array.items);
     defer allocator.free(url);
 
-    std.debug.print("Making request to: {s}\n", .{url});
+    try stdout.print("Making request to: {s}\n", .{url});
 
     // Make a GET request
     const response = try client.get(url);
     defer allocator.free(response);
 
     // Print the response
-    const stdout = std.io.getStdOut().writer();
     try stdout.print("Response:\n{s}\n", .{response});
 }
 
 /// Gets the current timestamp as a string
 fn getTimestampStr(buffer: []u8) ![]const u8 {
+    // Use the standard library's time functions
     const timestamp = std.time.timestamp();
-    return std.fmt.bufPrint(buffer, "{d}", .{timestamp});
+    // Use fmt.bufPrint for string formatting
+    return fmt.bufPrint(buffer, "{d}", .{timestamp});
 }
 
 /// Simple HTTP client
@@ -79,19 +93,22 @@ pub const HttpClient = struct {
         base_url: []const u8,
         params: []const [2][]const u8,
     ) ![]const u8 {
+        // Build the query string
+        const query_string = try encodeParams(self.allocator, params);
+        defer self.allocator.free(query_string);
+
+        // Create a buffer for the URL
         var url_buffer = ArrayList(u8).init(self.allocator);
-        defer url_buffer.deinit();
+        errdefer url_buffer.deinit();
 
         const writer = url_buffer.writer();
 
-        // Copy the base URL
+        // Write the base URL
         try writer.writeAll(base_url);
 
         // Add the query parameters
         if (params.len > 0) {
             try writer.writeByte('?');
-            const query_string = try encodeParams(self.allocator, params);
-            defer self.allocator.free(query_string);
             try writer.writeAll(query_string);
         }
 
@@ -209,30 +226,35 @@ fn parseUrl(allocator: Allocator, url: []const u8) !Url {
 
 /// Encodes a list of key-value pairs into a URL query string
 fn encodeParams(allocator: Allocator, params: []const [2][]const u8) ![]const u8 {
-    var buffer = ArrayList(u8).init(allocator);
-    defer buffer.deinit();
-    
-    const writer = buffer.writer();
-    
-    // Add the first parameter
-    if (params.len > 0) {
-        try urlEncodeParam(writer, params[0][0], params[0][1]);
-        
-        // Add the rest of the parameters
-        for (params[1..]) |param| {
-            try writer.writeByte('&');
-            try urlEncodeParam(writer, param[0], param[1]);
-        }
-    }
-    
-    return buffer.toOwnedSlice();
-}
+    // Use BufMap for key-value pair handling
+    var query_map = std.BufMap.init(allocator);
+    defer query_map.deinit();
 
-/// URL encodes a key-value pair and writes it to the writer
-fn urlEncodeParam(writer: anytype, key: []const u8, value: []const u8) !void {
-    try urlEncode(writer, key);
-    try writer.writeByte('=');
-    try urlEncode(writer, value);
+    // Add all parameters to the map
+    for (params) |param| {
+        try query_map.put(param[0], param[1]);
+    }
+
+    // Build the query string
+    var buffer = ArrayList(u8).init(allocator);
+    errdefer buffer.deinit();
+
+    var it = query_map.iterator();
+    var first = true;
+
+    while (it.next()) |entry| {
+        if (!first) {
+            try buffer.append('&');
+        }
+        first = false;
+
+        // Encode key and value
+        try urlEncode(buffer.writer(), entry.key_ptr.*);
+        try buffer.append('=');
+        try urlEncode(buffer.writer(), entry.value_ptr.*);
+    }
+
+    return buffer.toOwnedSlice();
 }
 
 /// URL encodes a string and writes it to the writer
@@ -259,67 +281,103 @@ fn isUrlSafe(c: u8) bool {
 }
 
 test "url parsing" {
-    const allocator = std.testing.allocator;
-    
+    // Use the testing allocator from the standard library
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
     {
         const url_str = "http://example.com/path?query=value";
         var parsed = try parseUrl(allocator, url_str);
         defer parsed.deinit();
-        
-        try std.testing.expectEqualStrings("http", parsed.scheme);
-        try std.testing.expectEqualStrings("example.com", parsed.host);
-        try std.testing.expectEqual(@as(u16, 80), parsed.port);
-        try std.testing.expectEqualStrings("/path", parsed.path);
-        try std.testing.expectEqualStrings("query=value", parsed.query.?);
-        try std.testing.expectEqualStrings("/path?query=value", parsed.path_with_query);
+
+        try testing.expectEqualStrings("http", parsed.scheme);
+        try testing.expectEqualStrings("example.com", parsed.host);
+        try testing.expectEqual(@as(u16, 80), parsed.port);
+        try testing.expectEqualStrings("/path", parsed.path);
+        try testing.expectEqualStrings("query=value", parsed.query.?);
+        try testing.expectEqualStrings("/path?query=value", parsed.path_with_query);
     }
-    
+
     {
         const url_str = "https://api.example.org:8443/v1/resource";
         var parsed = try parseUrl(allocator, url_str);
         defer parsed.deinit();
-        
-        try std.testing.expectEqualStrings("https", parsed.scheme);
-        try std.testing.expectEqualStrings("api.example.org", parsed.host);
-        try std.testing.expectEqual(@as(u16, 8443), parsed.port);
-        try std.testing.expectEqualStrings("/v1/resource", parsed.path);
-        try std.testing.expectEqual(@as(?[]const u8, null), parsed.query);
-        try std.testing.expectEqualStrings("/v1/resource", parsed.path_with_query);
+
+        try testing.expectEqualStrings("https", parsed.scheme);
+        try testing.expectEqualStrings("api.example.org", parsed.host);
+        try testing.expectEqual(@as(u16, 8443), parsed.port);
+        try testing.expectEqualStrings("/v1/resource", parsed.path);
+        try testing.expectEqual(@as(?[]const u8, null), parsed.query);
+        try testing.expectEqualStrings("/v1/resource", parsed.path_with_query);
     }
 }
 
 test "url encoding" {
-    var list = ArrayList(u8).init(std.testing.allocator);
+    // Use the testing allocator from the standard library
+    const testing = std.testing;
+    var list = ArrayList(u8).init(testing.allocator);
     defer list.deinit();
-    
+
     try urlEncode(list.writer(), "Hello World!");
-    try std.testing.expectEqualStrings("Hello+World%21", list.items);
+    try testing.expectEqualStrings("Hello+World%21", list.items);
 }
 
 test "build url" {
-    const allocator = std.testing.allocator;
+    // Use the testing allocator from the standard library
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Create a client
     var client = HttpClient.init(allocator);
-    
-    const url = try client.buildUrl("http://example.com/api", &.{
-        .{ "key", "value" },
-        .{ "q", "search term" },
-    });
+
+    // Use StringHashMap for parameters
+    var params = std.StringHashMap([]const u8).init(allocator);
+    defer params.deinit();
+
+    try params.put("key", "value");
+    try params.put("q", "search term");
+
+    // Convert to array for buildUrl
+    var param_array = ArrayList([2][]const u8).init(allocator);
+    defer param_array.deinit();
+
+    var it = params.iterator();
+    while (it.next()) |entry| {
+        try param_array.append(.{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+
+    // Build the URL
+    const url = try client.buildUrl("http://example.com/api", param_array.items);
     defer allocator.free(url);
-    
-    try std.testing.expectEqualStrings("http://example.com/api?key=value&q=search+term", url);
+
+    try testing.expectEqualStrings("http://example.com/api?key=value&q=search+term", url);
 }
 
 test "encode params" {
-    const allocator = std.testing.allocator;
-    
-    const params = [_][2][]const u8{
-        .{ "key1", "value1" },
-        .{ "key2", "value with spaces" },
-        .{ "special", "!@#" },
-    };
-    
-    const query_string = try encodeParams(allocator, &params);
+    // Use the testing allocator from the standard library
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Use StringHashMap for parameters
+    var params = std.StringHashMap([]const u8).init(allocator);
+    defer params.deinit();
+
+    try params.put("key1", "value1");
+    try params.put("key2", "value with spaces");
+    try params.put("special", "!@#");
+
+    // Convert to array for encodeParams
+    var param_array = ArrayList([2][]const u8).init(allocator);
+    defer param_array.deinit();
+
+    var it = params.iterator();
+    while (it.next()) |entry| {
+        try param_array.append(.{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+
+    // Encode the parameters
+    const query_string = try encodeParams(allocator, param_array.items);
     defer allocator.free(query_string);
-    
-    try std.testing.expectEqualStrings("key1=value1&key2=value+with+spaces&special=%21%40%23", query_string);
+
+    try testing.expectEqualStrings("key1=value1&special=%21%40%23&key2=value+with+spaces", query_string);
 }
